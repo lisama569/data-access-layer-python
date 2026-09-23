@@ -1,8 +1,11 @@
-from fastapi import FastAPI
+"""兼容入口：实际应用位于 app.main。
 
-app = FastAPI()
+启动方式：uv run uvicorn app.main:app --reload
+"""
 
+from app.main import app  # noqa: F401
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app.main:app", reload=True)
