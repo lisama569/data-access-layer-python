@@ -102,3 +102,83 @@ def test_http_pagination_walk(client: TestClient) -> None:
             break
         cursor = body["next_cursor"]
     assert len(ids) == len(set(ids)) == 7
+
+
+def test_http_delete_restore_lifecycle(client: TestClient) -> None:
+    created = _create(client, name="lifecycle")
+    rid = created["id"]
+
+    # 删除
+    resp = client.request("DELETE", f"/resources/{rid}", json={"expected_version": 1})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "deleted" and body["version"] == 2
+    assert body["deleted_at"] is not None
+
+    # 默认单查 / 列表视为不存在
+    assert client.get(f"/resources/{rid}").status_code == 404
+    listed = client.get("/resources", params={"status": "active"}).json()
+    assert listed["items"] == []
+    trash = client.get("/resources", params={"status": "deleted"}).json()
+    assert [i["id"] for i in trash["items"]] == [rid]
+
+    # 名字可复用
+    other = _create(client, name="lifecycle")
+    # 恢复撞名 => 409 unique_constraint_violation
+    resp = client.post(
+        f"/resources/{rid}/restore", json={"expected_version": 2}
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "unique_constraint_violation"
+
+    # 释放占用名后恢复成功
+    assert client.request(
+        "DELETE", f"/resources/{other['id']}", json={"expected_version": 1}
+    ).status_code == 200
+    resp = client.post(
+        f"/resources/{rid}/restore", json={"expected_version": 2}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "active"
+    assert resp.json()["version"] == 3
+
+    # 状态错误归类
+    resp = client.post(
+        f"/resources/{rid}/restore", json={"expected_version": 3}
+    )
+    assert resp.status_code == 409
+    err = resp.json()["error"]
+    assert err["code"] == "invalid_state"
+    assert err["current_status"] == "active"
+
+
+def test_http_delete_conflict_codes_distinct(client: TestClient) -> None:
+    created = _create(client, name="c")
+    rid = created["id"]
+    # 先把版本推到 2
+    assert client.put(
+        f"/resources/{rid}", json={"expected_version": 1}
+    ).status_code == 200
+    # 拿过期版本删除 => version_conflict
+    resp = client.request(
+        "DELETE", f"/resources/{rid}", json={"expected_version": 1}
+    )
+    assert resp.status_code == 409
+    err = resp.json()["error"]
+    assert err["code"] == "version_conflict"
+    assert err["current_version"] == 2
+    # 资源未被删除
+    assert client.get(f"/resources/{rid}").status_code == 200
+
+
+def test_http_purge_endpoint(client: TestClient) -> None:
+    created = _create(client, name="trashme")
+    client.request(
+        "DELETE", f"/resources/{created['id']}", json={"expected_version": 1}
+    )
+    resp = client.post("/resources/purge", json={"retention_ms": 0})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["purged"] >= 1
+    assert {"purged", "scanned", "has_more", "batches"} <= set(body)
+    assert client.get(f"/resources/{created['id']}").status_code == 404

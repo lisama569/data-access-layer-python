@@ -7,24 +7,58 @@ from __future__ import annotations
 import sqlite3
 
 from app.cursor import decode_cursor, encode_cursor
-from app.errors import ResourceNotFoundError, VersionConflictError
-from app.models import Page, Resource, ResourceCreate, ResourceQuery, ResourceUpdate
+from app.errors import (
+    InvalidStateError,
+    ResourceNotFoundError,
+    VersionConflictError,
+)
+from app.models import (
+    STATUS_ACTIVE,
+    STATUS_DELETED,
+    Page,
+    Resource,
+    ResourceCreate,
+    ResourceQuery,
+    ResourceUpdate,
+)
 
 MAX_PAGE_SIZE = 100
 
 _INSERT_SQL = (
-    "INSERT INTO resources (id, name, payload, version, created_at, updated_at) "
-    "VALUES (:id, :name, :payload, 1, :now, :now)"
+    "INSERT INTO resources (id, name, payload, version, created_at, updated_at, "
+    "status, deleted_at) "
+    "VALUES (:id, :name, :payload, 1, :now, :now, 'active', NULL)"
 )
 
 _UPDATE_SQL = (
     "UPDATE resources SET name = :name, payload = :payload, "
     "version = version + 1, updated_at = :now "
-    "WHERE id = :id AND version = :expected_version"
+    "WHERE id = :id AND version = :expected_version AND status = 'active'"
 )
 
+_SOFT_DELETE_SQL = (
+    "UPDATE resources SET status = 'deleted', deleted_at = :now, "
+    "updated_at = :now, version = version + 1 "
+    "WHERE id = :id AND version = :expected_version AND status = 'active'"
+)
+
+_RESTORE_SQL = (
+    "UPDATE resources SET status = 'active', deleted_at = NULL, "
+    "updated_at = :now, version = version + 1 "
+    "WHERE id = :id AND version = :expected_version AND status = 'deleted'"
+)
+
+_PURGE_SELECT_SQL = (
+    "SELECT id FROM resources WHERE status = 'deleted' "
+    "AND deleted_at IS NOT NULL AND deleted_at <= :cutoff "
+    "ORDER BY deleted_at ASC, id ASC LIMIT :limit"
+)
+
+_PURGE_DELETE_SQL = "DELETE FROM resources WHERE id IN ({ids})"
+
 _SELECT_SQL = (
-    "SELECT id, name, payload, version, created_at, updated_at FROM resources"
+    "SELECT id, name, payload, version, created_at, updated_at, status, deleted_at "
+    "FROM resources"
 )
 
 
@@ -36,6 +70,8 @@ def _row_to_resource(row: sqlite3.Row) -> Resource:
         version=row["version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        status=row["status"],
+        deleted_at=row["deleted_at"],
     )
 
 
@@ -50,10 +86,7 @@ class ResourceRepository:
             "payload": data.payload,
             "now": now_ms,
         }
-        try:
-            self.conn.execute(_INSERT_SQL, params)
-        except sqlite3.Error:
-            raise
+        self.conn.execute(_INSERT_SQL, params)
         row = self.conn.execute(
             _SELECT_SQL + " WHERE id = ?", (resource_id,)
         ).fetchone()
@@ -68,12 +101,13 @@ class ResourceRepository:
     def update_optimistic(self, change: ResourceUpdate, *, now_ms: int) -> Resource:
         """按 ``expected_version`` 做原子条件更新。
 
-        - 资源不存在 => :class:`ResourceNotFoundError`
+        - 资源物理不存在或已在回收站 => :class:`ResourceNotFoundError`
+          （回收站资源在默认读写视角下等同于不存在）
         - 版本不匹配 => :class:`VersionConflictError`（携带期望/当前版本号）
         - name 唯一约束冲突 => :class:`UniqueConstraintError`（由连接层翻译）
         """
         current = self.get(change.id)
-        if current is None:
+        if current is None or current.status != STATUS_ACTIVE:
             raise ResourceNotFoundError(f"资源不存在: id={change.id}")
 
         params = {
@@ -97,6 +131,97 @@ class ResourceRepository:
         assert updated is not None
         return updated
 
+    def soft_delete(self, change, *, now_ms: int) -> Resource:
+        """带乐观锁的软删除：仅正常资源可删。
+
+        判定顺序：资源存在性 -> 当前状态 -> 版本。
+        已删除再删 => :class:`InvalidStateError`；版本落后 =>
+        :class:`VersionConflictError`。
+        """
+        current = self.get(change.id)
+        if current is None:
+            raise ResourceNotFoundError(f"资源不存在: id={change.id}")
+        if current.status != STATUS_ACTIVE:
+            raise InvalidStateError(
+                "资源已在回收站，无需重复删除",
+                resource_id=change.id,
+                current_status=current.status,
+            )
+        cur = self.conn.execute(
+            _SOFT_DELETE_SQL,
+            {"id": change.id, "expected_version": change.expected_version, "now": now_ms},
+        )
+        if cur.rowcount == 0:
+            self._raise_post_check(change.id, change.expected_version)
+        deleted = self.get(change.id)
+        assert deleted is not None
+        return deleted
+
+    def restore(self, change, *, now_ms: int) -> Resource:
+        """带乐观锁的恢复：仅回收站资源可恢复。
+
+        名字已被其他正常资源占用时，partial unique index 触发冲突，
+        由连接层翻译为 :class:`UniqueConstraintError`。
+        """
+        current = self.get(change.id)
+        if current is None:
+            raise ResourceNotFoundError(f"资源不存在: id={change.id}")
+        if current.status != STATUS_DELETED:
+            raise InvalidStateError(
+                "资源处于正常状态，无需恢复",
+                resource_id=change.id,
+                current_status=current.status,
+            )
+        cur = self.conn.execute(
+            _RESTORE_SQL,
+            {"id": change.id, "expected_version": change.expected_version, "now": now_ms},
+        )
+        if cur.rowcount == 0:
+            self._raise_post_check(change.id, change.expected_version)
+        restored = self.get(change.id)
+        assert restored is not None
+        return restored
+
+    def _raise_post_check(self, resource_id: str, expected_version: int) -> None:
+        """条件 UPDATE 影响 0 行后的归因。
+
+        能走到这里说明请求发起时前置校验（存在性 + 状态）已通过，提交瞬间
+        被并发请求抢先（无论是同操作还是对向操作）——本质是乐观锁失败，
+        统一归 :class:`VersionConflictError`，携带最新版本号供调用方重读重试。
+        纯状态误用（如对 active 资源发恢复）在前置校验阶段已归
+        :class:`InvalidStateError`。
+        """
+        latest = self.get(resource_id)
+        raise VersionConflictError(
+            "版本冲突：资源已被其他请求修改，请基于最新版本重试",
+            resource_id=resource_id,
+            expected_version=expected_version,
+            current_version=latest.version if latest is not None else -1,
+        )
+
+    def purge_expired(
+        self, *, now_ms: int, retention_ms: int, batch_size: int
+    ) -> tuple[int, int, bool]:
+        """物理清除一批 ``deleted_at + retention_ms <= now`` 的回收站资源。
+
+        返回 ``(本批清除条数, 本批扫描候选数, 是否还可能有下一批)``。只删除
+        按保留期确定到期的行；保留期内、已恢复或被重新删除（deleted_at
+        刷新）的行不受影响。
+        """
+        cutoff = now_ms - retention_ms
+        rows = self.conn.execute(
+            _PURGE_SELECT_SQL, {"cutoff": cutoff, "limit": batch_size}
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            placeholders = ",".join(f":id{i}" for i in range(len(ids)))
+            params = {f"id{i}": value for i, value in enumerate(ids)}
+            cur = self.conn.execute(_PURGE_DELETE_SQL.format(ids=placeholders), params)
+            purged = cur.rowcount
+        else:
+            purged = 0
+        return purged, len(ids), purged == batch_size
+
     def query_page(self, query: ResourceQuery) -> Page:
         """按固定排序键 ``(created_at ASC, id ASC)`` 做 keyset 分页。
 
@@ -106,6 +231,9 @@ class ResourceRepository:
         page_size = min(max(query.page_size, 1), MAX_PAGE_SIZE)
         where: list[str] = []
         params: list[object] = []
+        if query.status != "all":
+            where.append("status = ?")
+            params.append(query.status)
         if query.name_contains:
             where.append("name LIKE ?")
             params.append(f"%{query.name_contains}%")

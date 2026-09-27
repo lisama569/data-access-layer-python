@@ -17,15 +17,52 @@ from app.errors import StorageError, UniqueConstraintError
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS resources (
     id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
     payload    TEXT NOT NULL DEFAULT '',
     version    INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'active',
+    deleted_at INTEGER
 );
 """
 
+# 仅正常状态的资源占用名字：删除即释放名字；恢复时若名字已被其他正常
+# 资源占用，由该索引触发唯一约束冲突，保证绝不出现两个同名正常资源。
+ACTIVE_NAME_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "ux_resources_active_name ON resources(name) WHERE status = 'active'"
+)
+
 BUSY_TIMEOUT_MS = 5_000
+
+
+def _needs_migration(conn: sqlite3.Connection) -> bool:
+    """旧结构没有 status 列；资源表不存在时无需迁移（SCHEMA_SQL 会新建）。"""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources'"
+    ).fetchone()
+    if row is None:
+        return False
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(resources)")}
+    return "status" not in columns
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """把旧表整表搬运到带生命周期列的新结构。
+
+    SQLite 无法直接 DROP COLUMN（旧版本）/删除列上的表级约束，故改名后
+    重建：旧数据 status 置为 active、deleted_at 置空，版本号原样保留。
+    """
+    conn.execute("ALTER TABLE resources RENAME TO resources_legacy")
+    conn.execute(SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO resources "
+        "(id, name, payload, version, created_at, updated_at, status, deleted_at) "
+        "SELECT id, name, payload, version, created_at, updated_at, 'active', NULL "
+        "FROM resources_legacy"
+    )
+    conn.execute("DROP TABLE resources_legacy")
 
 
 def translate_sqlite_error(exc: sqlite3.Error) -> Exception:
@@ -51,14 +88,29 @@ class Database:
         return self.path == ":memory:"
 
     def initialize(self) -> None:
-        """创建表结构；幂等，可重复调用。"""
+        """创建表结构；幂等，可重复调用。
+
+        对早期建表（无 ``status`` / ``deleted_at`` 列、``name`` 上为表级
+        UNIQUE 约束）的库做一次性在线迁移：整表搬运到新结构，旧数据全部
+        视为正常资源，迁移包在一个事务里，失败不留下半张表。
+        """
         try:
             conn = self.connect()
             try:
                 if not self.is_memory:
                     conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute(SCHEMA_SQL)
-                conn.commit()
+                if _needs_migration(conn):
+                    _migrate_schema(conn)
+                conn.execute(ACTIVE_NAME_INDEX_SQL)
+                conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
             finally:
                 conn.close()
         except sqlite3.Error as exc:

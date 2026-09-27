@@ -41,6 +41,24 @@ class VersionConflictError(DataAccessError):
         self.current_version = current_version
 
 
+class InvalidStateError(DataAccessError):
+    """资源当前状态不允许所请求的生命周期操作。"""
+
+    code = "invalid_state"
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        resource_id: str = "",
+        current_status: str = "",
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(message, cause=cause)
+        self.resource_id = resource_id
+        self.current_status = current_status
+
+
 class UniqueConstraintError(DataAccessError):
     code = "unique_constraint_violation"
 
