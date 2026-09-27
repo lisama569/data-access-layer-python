@@ -102,3 +102,97 @@ def test_http_pagination_walk(client: TestClient) -> None:
             break
         cursor = body["next_cursor"]
     assert len(ids) == len(set(ids)) == 7
+
+
+def test_http_lifecycle_delete_restore(client: TestClient) -> None:
+    r = _create(client, name="lifecycle", payload="p0")
+
+    # 删除
+    resp = client.post(
+        f"/resources/{r['id']}/delete", json={"expected_version": 1}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "deleted" and body["version"] == 2
+    assert body["deleted_at"] is not None
+
+    # 默认单查 404，默认列表看不到
+    assert client.get(f"/resources/{r['id']}").status_code == 404
+    listed = client.get("/resources", params={"page_size": 10}).json()
+    assert listed["items"] == []
+
+    # 回收站视图可见
+    trash = client.get(
+        "/resources", params={"page_size": 10, "status": "deleted"}
+    ).json()
+    assert [i["id"] for i in trash["items"]] == [r["id"]]
+
+    # 旧版本删除 => 409 version_conflict
+    resp = client.post(
+        f"/resources/{r['id']}/delete", json={"expected_version": 1}
+    )
+    assert resp.status_code == 409
+    err = resp.json()["error"]
+    assert err["code"] == "version_conflict"
+    assert err["current_version"] == 2
+
+    # 当前版本重复删 => 409 resource_state_conflict
+    resp = client.post(
+        f"/resources/{r['id']}/delete", json={"expected_version": 2}
+    )
+    assert resp.status_code == 409
+    err = resp.json()["error"]
+    assert err["code"] == "resource_state_conflict"
+    assert err["current_state"] == "deleted"
+
+    # 恢复
+    resp = client.post(
+        f"/resources/{r['id']}/restore", json={"expected_version": 2}
+    )
+    assert resp.status_code == 200
+    restored = resp.json()
+    assert restored["status"] == "active" and restored["version"] == 3
+    assert restored["deleted_at"] is None
+    assert client.get(f"/resources/{r['id']}").status_code == 200
+
+
+def test_http_delete_missing_is_404(client: TestClient) -> None:
+    resp = client.post("/resources/ghost/delete", json={"expected_version": 1})
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "resource_not_found"
+
+
+def test_http_invalid_status_filter_is_400(client: TestClient) -> None:
+    resp = client.get("/resources", params={"status": "archived"})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+def test_http_purge_endpoint(client: TestClient) -> None:
+    r = _create(client, name="trashme")
+    assert client.post(
+        f"/resources/{r['id']}/delete", json={"expected_version": 1}
+    ).status_code == 200
+    # retention_ms=0：已删除记录立即超期
+    resp = client.post(
+        "/maintenance/purge-deleted",
+        json={"retention_ms": 0, "batch_size": 50},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["purged_count"] == 1
+    assert body["batch_count"] == 1
+    assert body["has_more"] is False
+    assert "cutoff_ms" in body and "retention_ms" in body
+    # 物理清除后默认单查 404，回收站视图为空
+    assert client.get(f"/resources/{r['id']}").status_code == 404
+    assert client.get(
+        "/resources", params={"status": "deleted"}
+    ).json()["items"] == []
+
+
+def test_http_purge_invalid_body_is_400(client: TestClient) -> None:
+    resp = client.post(
+        "/maintenance/purge-deleted", json={"retention_ms": -1}
+    )
+    assert resp.status_code == 422  # pydantic 入参校验

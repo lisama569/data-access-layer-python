@@ -14,11 +14,19 @@ from app.errors import (
     InvalidCursorError,
     InvalidInputError,
     ResourceNotFoundError,
+    ResourceStateError,
     UniqueConstraintError,
     VersionConflictError,
 )
 from app.connection import Database
-from app.models import ResourceCreate, ResourceQuery, ResourceUpdate
+from app.models import (
+    ResourceCreate,
+    ResourceDelete,
+    ResourceQuery,
+    ResourceRestore,
+    ResourceStatus,
+    ResourceUpdate,
+)
 from app.service import ResourceService
 
 _STATUS_MAP: dict[str, int] = {
@@ -26,6 +34,7 @@ _STATUS_MAP: dict[str, int] = {
     InvalidCursorError.code: 400,
     ResourceNotFoundError.code: 404,
     VersionConflictError.code: 409,
+    ResourceStateError.code: 409,
     UniqueConstraintError.code: 409,
     DataAccessError.code: 500,
 }
@@ -43,6 +52,15 @@ class UpdateBody(BaseModel):
     payload: str | None = None
 
 
+class ExpectedVersionBody(BaseModel):
+    expected_version: int = Field(ge=1)
+
+
+class PurgeBody(BaseModel):
+    retention_ms: int | None = Field(default=None, ge=0)
+    batch_size: int | None = Field(default=None, ge=1)
+
+
 def _resource_to_dict(r) -> dict:
     return {
         "id": r.id,
@@ -51,6 +69,8 @@ def _resource_to_dict(r) -> dict:
         "version": r.version,
         "created_at": r.created_at,
         "updated_at": r.updated_at,
+        "status": r.status.value if isinstance(r.status, ResourceStatus) else str(r.status),
+        "deleted_at": r.deleted_at,
     }
 
 
@@ -67,6 +87,9 @@ def create_app(db: Database) -> FastAPI:
             body["error"]["resource_id"] = exc.resource_id
             body["error"]["expected_version"] = exc.expected_version
             body["error"]["current_version"] = exc.current_version
+        elif isinstance(exc, ResourceStateError):
+            body["error"]["resource_id"] = exc.resource_id
+            body["error"]["current_state"] = exc.current_state
         return JSONResponse(status_code=status, content=body)
 
     @app.post("/resources", status_code=201)
@@ -97,18 +120,54 @@ def create_app(db: Database) -> FastAPI:
         name_contains: str | None = None,
         page_size: int = 20,
         cursor: str | None = None,
+        status: str = "active",
     ):
+        try:
+            resource_status = ResourceStatus(status)
+        except ValueError:
+            raise InvalidInputError(
+                "status 必须是 active / deleted / all 之一"
+            )
         page = service.list_resources(
             ResourceQuery(
                 name_contains=name_contains,
                 page_size=page_size,
                 cursor=cursor,
+                status=resource_status,
             )
         )
         return {
             "items": [_resource_to_dict(i) for i in page.items],
             "next_cursor": page.next_cursor,
             "has_more": page.has_more,
+        }
+
+    @app.post("/resources/{resource_id}/delete")
+    def soft_delete(resource_id: str, body: ExpectedVersionBody):
+        resource = service.delete_resource(
+            ResourceDelete(id=resource_id, expected_version=body.expected_version)
+        )
+        return _resource_to_dict(resource)
+
+    @app.post("/resources/{resource_id}/restore")
+    def restore(resource_id: str, body: ExpectedVersionBody):
+        resource = service.restore_resource(
+            ResourceRestore(id=resource_id, expected_version=body.expected_version)
+        )
+        return _resource_to_dict(resource)
+
+    @app.post("/maintenance/purge-deleted")
+    def purge_deleted(body: PurgeBody):
+        result = service.purge_deleted(
+            retention_ms=body.retention_ms,
+            batch_size=body.batch_size if body.batch_size is not None else 100,
+        )
+        return {
+            "purged_count": result.purged_count,
+            "batch_count": result.batch_count,
+            "cutoff_ms": result.cutoff_ms,
+            "retention_ms": result.retention_ms,
+            "has_more": result.has_more,
         }
 
     return app

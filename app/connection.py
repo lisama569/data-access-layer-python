@@ -21,9 +21,23 @@ CREATE TABLE IF NOT EXISTS resources (
     payload    TEXT NOT NULL DEFAULT '',
     version    INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'active',
+    deleted_at INTEGER
 );
 """
+
+# 回收站按 deleted_at 排序分批清理的部分索引
+DELETED_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_resources_deleted_at "
+    "ON resources(deleted_at, id) WHERE status = 'deleted'"
+)
+
+# 老库平滑升级：缺列时补齐（SQLite ADD COLUMN 带常量默认值，可在线执行）
+_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("status", "ALTER TABLE resources ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+    ("deleted_at", "ALTER TABLE resources ADD COLUMN deleted_at INTEGER"),
+)
 
 BUSY_TIMEOUT_MS = 5_000
 
@@ -51,18 +65,30 @@ class Database:
         return self.path == ":memory:"
 
     def initialize(self) -> None:
-        """创建表结构；幂等，可重复调用。"""
+        """创建表结构并执行幂等迁移；可重复调用。"""
         try:
             conn = self.connect()
             try:
                 if not self.is_memory:
                     conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute(SCHEMA_SQL)
+                self._migrate(conn)
+                conn.execute(DELETED_INDEX_SQL)
                 conn.commit()
             finally:
                 conn.close()
         except sqlite3.Error as exc:
             raise translate_sqlite_error(exc) from exc
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(resources)").fetchall()
+        }
+        for column, ddl in _MIGRATION_COLUMNS:
+            if column not in existing:
+                conn.execute(ddl)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
