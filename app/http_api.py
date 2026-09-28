@@ -73,9 +73,9 @@ def _resource_to_dict(r) -> dict:
     }
 
 
-def create_app(db: Database) -> FastAPI:
+def create_app(db: Database, *, clock=None) -> FastAPI:
     app = FastAPI(title="persistent-dal")
-    service = ResourceService(db)
+    service = ResourceService(db, clock=clock) if clock is not None else ResourceService(db)
     app.state.service = service
 
     @app.exception_handler(DataAccessError)

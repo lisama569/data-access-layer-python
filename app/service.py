@@ -172,10 +172,13 @@ class ResourceService:
         """按保留期分批物理清除回收站资源。
 
         - ``retention_ms``：回收站保留时长，缺省用服务级默认值，必须为非负整数；
+        - 到期判定严格：只清 ``deleted_at + retention_ms < now`` 的行，时间点
+          刚好卡在保留期上（==）的行一定保留，实际可恢复时间不会比配置更短；
         - 每批在自己的短事务里提交，批间不持锁，避免长时间阻塞正常读写；
         - 中途失败重试是幂等的：已提交的批不会被重复清除，到期判定始终
-          基于 ``deleted_at + retention_ms`` 重新计算；
-        - 返回 :class:`PurgeResult` 解释本次清了多少、扫描了多少、是否还有积压。
+          基于 ``deleted_at + retention_ms`` 与当前时间重新计算；
+        - 返回 :class:`PurgeResult` 解释本次清了多少、扫描了多少、
+          **清理后**是否还有到期积压（最后一批清空时 ``has_more`` 必为 False）。
         """
         retention = self.default_retention_ms if retention_ms is None else retention_ms
         size = self.purge_batch_size if batch_size is None else batch_size

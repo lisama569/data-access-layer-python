@@ -17,6 +17,20 @@ def client(db: Database) -> TestClient:
     return TestClient(create_app(db))
 
 
+class FakeClock:
+    def __init__(self, start: int = 1_000_000) -> None:
+        self.t = start
+
+    def __call__(self) -> int:
+        return self.t
+
+
+@pytest.fixture
+def clocked_client(db: Database):
+    clock = FakeClock()
+    return clock, TestClient(create_app(db, clock=clock))
+
+
 def _create(client: TestClient, name: str = "doc", payload: str = "") -> dict:
     resp = client.post("/resources", json={"name": name, "payload": payload})
     assert resp.status_code == 201, resp.text
@@ -171,14 +185,26 @@ def test_http_delete_conflict_codes_distinct(client: TestClient) -> None:
     assert client.get(f"/resources/{rid}").status_code == 200
 
 
-def test_http_purge_endpoint(client: TestClient) -> None:
+def test_http_purge_endpoint(clocked_client) -> None:
+    clock, client = clocked_client
     created = _create(client, name="trashme")
     client.request(
         "DELETE", f"/resources/{created['id']}", json={"expected_version": 1}
     )
+    # 与删除同一毫秒、retention_ms=0：边界相等，严格保留下不能清
+    resp = client.post("/resources/purge", json={"retention_ms": 0})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["purged"] == 0
+    trash = client.get("/resources", params={"status": "deleted"}).json()
+    assert [i["id"] for i in trash["items"]] == [created["id"]]
+
+    # 时间确实超过保留期后再清：成功
+    clock.t += 1
     resp = client.post("/resources/purge", json={"retention_ms": 0})
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["purged"] >= 1
+    assert body["purged"] == 1
     assert {"purged", "scanned", "has_more", "batches"} <= set(body)
+    assert body["has_more"] is False
+    # 回收站已空，默认单查依旧 404
     assert client.get(f"/resources/{created['id']}").status_code == 404
