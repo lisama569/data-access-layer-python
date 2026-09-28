@@ -13,8 +13,25 @@ logger = logging.getLogger("app.dal")
 
 
 @pytest.fixture
-def client(db: Database) -> TestClient:
-    return TestClient(create_app(db))
+def clock():
+    class FakeClock:
+        def __init__(self) -> None:
+            self.t = 1_000_000
+
+        def __call__(self) -> int:
+            return self.t
+
+    return FakeClock()
+
+
+@pytest.fixture
+def client(db: Database, clock) -> TestClient:
+    # 注入确定性时钟，避免删除与清理落在同一毫秒导致的偶发
+    from app.service import ResourceService
+
+    app = create_app(db)
+    app.state.service = ResourceService(db, clock=clock)
+    return TestClient(app)
 
 
 def _create(client: TestClient, name: str = "doc", payload: str = "") -> dict:
@@ -171,14 +188,17 @@ def test_http_delete_conflict_codes_distinct(client: TestClient) -> None:
     assert client.get(f"/resources/{rid}").status_code == 200
 
 
-def test_http_purge_endpoint(client: TestClient) -> None:
+def test_http_purge_endpoint(client: TestClient, clock) -> None:
     created = _create(client, name="trashme")
     client.request(
         "DELETE", f"/resources/{created['id']}", json={"expected_version": 1}
     )
+    # 严格边界：推进 1ms 后 retention_ms=0 才确实到期
+    clock.t += 1
     resp = client.post("/resources/purge", json={"retention_ms": 0})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["purged"] >= 1
+    assert body["has_more"] is False
     assert {"purged", "scanned", "has_more", "batches"} <= set(body)
     assert client.get(f"/resources/{created['id']}").status_code == 404

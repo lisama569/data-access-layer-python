@@ -50,8 +50,15 @@ _RESTORE_SQL = (
 
 _PURGE_SELECT_SQL = (
     "SELECT id FROM resources WHERE status = 'deleted' "
-    "AND deleted_at IS NOT NULL AND deleted_at <= :cutoff "
+    # 严格边界：只有 deleted_at + retention_ms < now（即 deleted_at < cutoff）
+    # 才到期；刚好卡在边界（deleted_at = cutoff）仍在保留期内，不能清。
+    "AND deleted_at IS NOT NULL AND deleted_at < :cutoff "
     "ORDER BY deleted_at ASC, id ASC LIMIT :limit"
+)
+
+_PURGE_REMAINING_SQL = (
+    "SELECT 1 FROM resources WHERE status = 'deleted' "
+    "AND deleted_at IS NOT NULL AND deleted_at < :cutoff LIMIT 1"
 )
 
 _PURGE_DELETE_SQL = "DELETE FROM resources WHERE id IN ({ids})"
@@ -134,13 +141,28 @@ class ResourceRepository:
     def soft_delete(self, change, *, now_ms: int) -> Resource:
         """带乐观锁的软删除：仅正常资源可删。
 
-        判定顺序：资源存在性 -> 当前状态 -> 版本。
-        已删除再删 => :class:`InvalidStateError`；版本落后 =>
-        :class:`VersionConflictError`。
+        判定顺序：资源存在性 -> 版本号 -> 当前状态。
+
+        - 物理不存在（从未创建 / 已被物理清理）=> :class:`ResourceNotFoundError`；
+        - 版本号落后（这期间被别人更新/删除/恢复过）=>
+          :class:`VersionConflictError`，哪怕并发结果恰好让资源进了回收站，
+          调用方真正需要知道的也是“自己手里的版本已经落后”；
+        - 版本就是最新、只是状态不适合（拿着当前版本对已删除资源再删）=>
+          :class:`InvalidStateError`。
+
+        条件 UPDATE 同时要求版本与状态匹配，失败的请求既不会被当成成功，
+        也不会覆盖他人先提交的结果。
         """
         current = self.get(change.id)
         if current is None:
             raise ResourceNotFoundError(f"资源不存在: id={change.id}")
+        if current.version != change.expected_version:
+            raise VersionConflictError(
+                "版本冲突：资源已被其他请求修改，请基于最新版本重试",
+                resource_id=change.id,
+                expected_version=change.expected_version,
+                current_version=current.version,
+            )
         if current.status != STATUS_ACTIVE:
             raise InvalidStateError(
                 "资源已在回收站，无需重复删除",
@@ -160,12 +182,22 @@ class ResourceRepository:
     def restore(self, change, *, now_ms: int) -> Resource:
         """带乐观锁的恢复：仅回收站资源可恢复。
 
-        名字已被其他正常资源占用时，partial unique index 触发冲突，
-        由连接层翻译为 :class:`UniqueConstraintError`。
+        判定顺序与 :meth:`soft_delete` 一致：存在性 -> 版本号 -> 当前状态。
+        两个拿着同一版本的并发恢复竞争时，胜者恢复成功，败者在锁内重读会发现
+        版本已推进（资源已被恢复），归 :class:`VersionConflictError`，绝不会把
+        已恢复资源再改一次。名字已被其他正常资源占用时，partial unique index
+        触发冲突，由连接层翻译为 :class:`UniqueConstraintError`。
         """
         current = self.get(change.id)
         if current is None:
             raise ResourceNotFoundError(f"资源不存在: id={change.id}")
+        if current.version != change.expected_version:
+            raise VersionConflictError(
+                "版本冲突：资源已被其他请求修改，请基于最新版本重试",
+                resource_id=change.id,
+                expected_version=change.expected_version,
+                current_version=current.version,
+            )
         if current.status != STATUS_DELETED:
             raise InvalidStateError(
                 "资源处于正常状态，无需恢复",
@@ -183,44 +215,60 @@ class ResourceRepository:
         return restored
 
     def _raise_post_check(self, resource_id: str, expected_version: int) -> None:
-        """条件 UPDATE 影响 0 行后的归因。
+        """条件 UPDATE 影响 0 行后的归因（防御性二次判定）。
 
-        能走到这里说明请求发起时前置校验（存在性 + 状态）已通过，提交瞬间
-        被并发请求抢先（无论是同操作还是对向操作）——本质是乐观锁失败，
-        统一归 :class:`VersionConflictError`，携带最新版本号供调用方重读重试。
-        纯状态误用（如对 active 资源发恢复）在前置校验阶段已归
-        :class:`InvalidStateError`。
+        前置校验在同一个 ``BEGIN IMMEDIATE`` 写事务内完成，正常串行情况下不会
+        走到这里；此方法只在前置快照与提交瞬间不一致时兜底。归因仍严格按
+        存在性 -> 版本号 -> 状态的顺序重新判定，保证三种原因始终分得清，
+        且不会把并发失败误报成状态不允许。
         """
         latest = self.get(resource_id)
-        raise VersionConflictError(
-            "版本冲突：资源已被其他请求修改，请基于最新版本重试",
+        if latest is None:
+            raise ResourceNotFoundError(f"资源不存在: id={resource_id}")
+        if latest.version != expected_version:
+            raise VersionConflictError(
+                "版本冲突：资源已被其他请求修改，请基于最新版本重试",
+                resource_id=resource_id,
+                expected_version=expected_version,
+                current_version=latest.version,
+            )
+        raise InvalidStateError(
+            "资源当前状态不允许该操作",
             resource_id=resource_id,
-            expected_version=expected_version,
-            current_version=latest.version if latest is not None else -1,
+            current_status=latest.status,
         )
 
     def purge_expired(
         self, *, now_ms: int, retention_ms: int, batch_size: int
     ) -> tuple[int, int, bool]:
-        """物理清除一批 ``deleted_at + retention_ms <= now`` 的回收站资源。
+        """物理清除一批严格超过保留期的回收站资源。
 
-        返回 ``(本批清除条数, 本批扫描候选数, 是否还可能有下一批)``。只删除
-        按保留期确定到期的行；保留期内、已恢复或被重新删除（deleted_at
-        刷新）的行不受影响。
+        到期判定为 ``deleted_at + retention_ms < now``（严格小于，
+        ``deleted_at == now - retention_ms`` 仍在保留期内，不删）。
+
+        返回 ``(本批清除条数, 本批扫描候选数, 清理后是否仍有到期积压)``。
+        ``has_more`` 反映**本批删除之后**的真实剩余情况：删除后在同一事务里
+        再探测一次到期集合，最后一批恰好清空时返回 ``False``，调用方不会被
+        误导继续跑。保留期内、已恢复或被重新删除（deleted_at 刷新）的行不受
+        影响；重试只可能看到仍到期的行，不会重复清理已提交删除的行。
         """
         cutoff = now_ms - retention_ms
         rows = self.conn.execute(
             _PURGE_SELECT_SQL, {"cutoff": cutoff, "limit": batch_size}
         ).fetchall()
         ids = [r["id"] for r in rows]
+        purged = 0
         if ids:
             placeholders = ",".join(f":id{i}" for i in range(len(ids)))
             params = {f"id{i}": value for i, value in enumerate(ids)}
             cur = self.conn.execute(_PURGE_DELETE_SQL.format(ids=placeholders), params)
             purged = cur.rowcount
-        else:
-            purged = 0
-        return purged, len(ids), purged == batch_size
+        # 删除后再探测：本批没取满说明本来就没有更多；取满了也要看删完后是否
+        # 真的还有到期行（最后一批恰好清空的关键场景）。
+        has_more = len(ids) >= batch_size and self.conn.execute(
+            _PURGE_REMAINING_SQL, {"cutoff": cutoff}
+        ).fetchone() is not None
+        return purged, len(ids), has_more
 
     def query_page(self, query: ResourceQuery) -> Page:
         """按固定排序键 ``(created_at ASC, id ASC)`` 做 keyset 分页。

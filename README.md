@@ -56,13 +56,24 @@ tests/             # 乐观锁 / 事务 / 分页 / 生命周期 / 清理 / 迁�
 | --- | --- | --- | --- |
 | 物理不存在 / 已被清理 | `resource_not_found` | 404 | 根本没有这个资源 |
 | 版本号落后 | `version_conflict` | 409 | 携带 `expected_version` 与当前 `current_version`，拒绝写入、不覆盖他人改动 |
-| 当前状态不允许该操作 | `invalid_state` | 409 | 如对已删除资源再删、对正常资源发恢复；携带 `current_status` |
+| 当前状态不允许该操作 | `invalid_state` | 409 | 仅当版本号就是最新、但资源状态确实不适合时（对已删除资源再删、对正常资源发恢复）；携带 `current_status` |
 | 恢复时名字已被占用 | `unique_constraint_violation` | 409 | 与版本冲突是不同 code |
 
-归因顺序：**存在性 → 当前状态 → 版本号**。即请求发起时资源状态就不适合
-（对 `active` 发恢复、对 `deleted` 发删除）得到 `invalid_state`；状态本身
-合适、只是版本落后（这期间被别人更新/删除/恢复过）得到 `version_conflict`，
-调用方应重新读取最新版本与状态后再决定是否重试。
+**冲突判定规则（归因顺序：存在性 → 版本号 → 当前状态）**
+
+1. 资源物理不存在（从未创建或已被物理清理）→ `resource_not_found`；
+2. 资源存在但 `expected_version` 与当前版本不一致（这期间被别人更新/删除/恢复
+   过）→ `version_conflict`。**即使并发结果恰好让状态也不再适合本操作**（例如
+   两个请求拿同一版本去删、胜者先删完；或拿落后版本重复删/恢复），也统一报
+   版本落后，因为调用方真正需要的信息是“手里的版本已过期，请重读最新版本与
+   状态再决定”；
+3. 只有版本号恰好就是最新、而资源当前状态确实不适合该操作（拿着当前版本对
+   `deleted` 资源再删、对 `active` 资源发恢复）→ `invalid_state`。
+
+两个并发的删除/恢复竞争同一行时恰有一个成功：败者在 `BEGIN IMMEDIATE`
+锁内重读会看到版本已被胜者推进，因此得到 `version_conflict`，既不会被当成
+成功，也不会覆盖胜者先提交的结果（条件 UPDATE 的 `WHERE` 同时要求版本与状态
+匹配，影响 0 行即整体拒绝）。
 
 ### 默认可见性与版本演进
 
@@ -85,23 +96,40 @@ tests/             # 乐观锁 / 事务 / 分页 / 生命周期 / 清理 / 迁�
 
 ### 保留期清理（物理清除）
 
-`ResourceService.purge_deleted(retention_ms?, batch_size?, max_batches?)`：
+`ResourceService.purge_deleted(retention_ms?, batch_size?, max_batches?, now_ms?)`：
 
-- 只删除满足 `status='deleted' AND deleted_at <= now - retention_ms` 的行；
-  保留期内、已恢复（`deleted_at=NULL`）或被重新删除（`deleted_at` 刷新）的
-  行都不会被误清。`retention_ms=0` 表示立即清除。
+- **保留期从什么时刻开始生效**：从软删除成功提交时写入的 `deleted_at`
+  （毫秒时间戳）起算；恢复会清空 `deleted_at`，重新删除则以新的
+  `deleted_at` 重新起算。到期判定为**严格超过**保留时长：
+
+  ```
+  可清理 ⇔ status='deleted' AND deleted_at IS NOT NULL
+           AND deleted_at + retention_ms < now
+  ```
+
+  即 `deleted_at + retention_ms == now`（时间点刚好卡在边界上）的记录**仍在
+  保留期内，一定不能清**；只有确实超过（`now` 再大 1ms）才进入清理范围。
+  因此实际可恢复时间不会比配置的保留时长短。`retention_ms=0` 同样遵守严格
+  边界：删除后需要时间严格晚于 `deleted_at` 才会被清。已恢复
+  （`deleted_at=NULL`）或被重新删除（`deleted_at` 刷新）的行不会被误清。
 - 默认保留 7 天（构造服务时可用 `default_retention_ms` 配置），默认批大小
-  500（`purge_batch_size` 配置），调用时均可覆盖。
+  500（`purge_batch_size` 配置），调用时均可覆盖；`now_ms` 可注入确定时刻
+  （测试/离线补偿场景），缺省用服务时钟。
 - **分批推进**：每批在自己的短事务里提交（先按
   `(deleted_at ASC, id ASC)` 取一批候选 id，再按 id 删除），批与批之间不持
-  写锁，不会长时间卡住正常读写；`max_batches` 可限制单次调用的工作量，返回
-  的 `has_more` 提示是否还有积压，调用方稍后继续调用即可。
+  写锁，不会长时间卡住正常读写；`max_batches` 可限制单次调用的工作量。
+- **`has_more` 的含义（清理后的真实剩余）**：每批删除后在同一事务内再探测
+  一次到期集合，`has_more=true` 表示**清理之后仍有到期积压**、需要继续调用；
+  `false` 表示此刻已无到期记录、本轮明确结束。最后一批恰好把积压清空时
+  （到期总数恰好是批大小的整数倍）也会如实返回 `false`，调用方不必再跑。
+  若因 `max_batches` 提前停止且仍有剩余，则返回 `true`。
 - **失败重试结果一致**：某批失败只回滚该批，已提交的前批不会被重复处理；
-  重试时到期集合按当前时间重新计算，删除是幂等的“清到期行”，不会重复清理
-  或把状态搞乱。
-- 结果用 `PurgeResult` 解释：`purged`（清除数）、`scanned`（候选数）、
-  `batches`（实际批数）、`has_more`（是否还有积压）；底层存储异常仍按统一
-  规则翻译，不直接抛出。
+  重试时到期集合按当前时间重新计算，删除是幂等的“清到期行”，不会重复清理、
+  不会把状态搞乱，也不会误伤仍在保留期内（含卡在边界）的数据。
+- 结果用 `PurgeResult` 解释：`purged`（本次物理清除条数）、`scanned`
+  （本次选中的候选条数，正常等于各批实际删除数之和）、`batches`（实际执行
+  的批数；即使没有到期数据也会空跑一批以便给出确定结论）、`has_more`
+  （清理后是否仍有到期积压）；底层存储异常仍按统一规则翻译，不直接抛出。
 
 ## 并发与乐观锁规则
 
@@ -116,7 +144,9 @@ tests/             # 乐观锁 / 事务 / 分页 / 生命周期 / 清理 / 迁�
   与乐观锁冲突是不同的 `code`，原因可区分。
 - 文件库启用 WAL，写事务以 `BEGIN IMMEDIATE` 在开始时取得保留锁，
   写事务之间串行，锁等待由 `busy_timeout=5000ms` 兜底。因此两个并发的
-  删除/恢复竞争同一行时恰有一个成功，另一个拿到锁后读到的已是最新状态。
+  删除/恢复竞争同一行时恰有一个成功，败者拿到锁后读到的已是最新版本，
+  按“存在性 → 版本号 → 状态”顺序归因为 `version_conflict`，不会误报
+  `invalid_state`。
 
 ## 事务规则
 
@@ -184,6 +214,16 @@ uv run pytest
 uv run pytest tests/test_lifecycle.py tests/test_purge.py \
   -o log_cli=true -o log_cli_level=INFO
 
+# 只验证本次修复关心的四类语义：
+# 1) 并发删除/恢复的冲突原因（败者必须是 version_conflict 而非 invalid_state）
+uv run pytest tests/test_lifecycle.py -k "concurrent or stale or double or active"
+# 2) 保留期严格边界（卡在 deleted_at + retention 的记录不能清）
+uv run pytest tests/test_purge.py -k "boundary or zero_retention or keeps or removes_only"
+# 3) 最后一批恰好清空时 has_more 必须为 False
+uv run pytest tests/test_purge.py -k "last_batch or max_batches or batching"
+# 4) 清理中途失败后重试：不重复清理、不误伤保留期内（含边界）记录
+uv run pytest tests/test_purge.py -k "retry"
+
 # 3. 启动服务（默认在工作目录生成 data.db；旧结构库启动时自动迁移）
 DAL_DB_PATH=/tmp/dal.db uv run python main.py
 ```
@@ -207,11 +247,15 @@ curl -s -o /dev/null -w '%{http_code}\n' $BASE/resources/$ID   # 404
 curl -s -X POST $BASE/resources/$ID/restore -H 'content-type: application/json' \
   -d '{"expected_version":2}'
 
-# 再次删除后，按保留期清理（retention_ms=0 立即清；也可只清一批看 has_more）
+# 再次删除后，按保留期清理（retention_ms=0 表示删除时刻过去后立即到期；
+# 严格边界下与删除落在同一毫秒不会被清，稍后重试即可。
+# 也可只跑 max_batches=1 观察 has_more 是否提示还有下一批）
 curl -s -X DELETE $BASE/resources/$ID -H 'content-type: application/json' \
   -d '{"expected_version":3}'
 curl -s -X POST $BASE/resources/purge -H 'content-type: application/json' \
   -d '{"retention_ms":0,"batch_size":100}'
+# 返回 {"purged":N,"scanned":N,"has_more":false,"batches":M}；
+# has_more=false 表示清理后已无到期积压，无需继续调用。
 ```
 
 测试说明：
@@ -223,11 +267,15 @@ curl -s -X POST $BASE/resources/purge -H 'content-type: application/json' \
 - `tests/test_pagination.py`：全量翻页无重无漏、同一游标结果稳定、
   非法/过期游标拒绝或终止、翻页中删除与插入的语义。
 - `tests/test_lifecycle.py`：删除隐藏/恢复可见、版本单调递增、三类错误可区分、
-  更新/删除/恢复并发撞车、名字释放复用与恢复撞名。
+  并发删除/恢复竞争同一版本时败者归 `version_conflict`（不误报
+  `invalid_state`）、落后版本重复操作的归因、名字释放复用与恢复撞名。
 - `tests/test_lifecycle_pagination.py`：带 `status` 筛选翻页期间发生删除、
   恢复、物理清理与新增时不重不漏，游标跨筛选复用与非法状态拒绝。
-- `tests/test_purge.py`：到期判定、保留期内不误清、active/已恢复不清、
-  分批推进、中途失败重试结果一致、参数校验与结果可解释。
+- `tests/test_purge.py`：严格到期判定（卡在 `deleted_at + retention` 边界
+  不清、过去 1ms 才清）、保留期内/active/已恢复不误清、`retention_ms=0`
+  的严格边界、分批推进、最后一批恰好清空时 `has_more=false`、
+  `max_batches` 截断如实报剩余、中途失败重试结果一致且不误伤保留期内数据、
+  参数校验与结果可解释。
 - `tests/test_migration.py`：旧结构库迁移保数据、迁移后生命周期可用、重复初始化幂等。
 - `tests/test_http_api.py`：上述错误分类与生命周期/清理端点在 HTTP 入口下的
   状态码与响应体。

@@ -66,7 +66,14 @@ class Page:
 
 @dataclass(slots=True)
 class PurgeResult:
-    """单批（或一次）保留期清理的可解释结果。"""
+    """单批（或一次）保留期清理的可解释结果。
+
+    - ``purged``：本次物理清除条数；
+    - ``scanned``：本次选中的到期候选条数；
+    - ``has_more``：**清理完成后**是否仍有到期积压需要继续调用；
+      最后一批恰好清空时为 False，因 max_batches 截断但仍有剩余时为 True；
+    - ``batches``：本次实际执行的批数（无到期数据也会空跑一批给出确定结论）。
+    """
 
     purged: int = 0
     scanned: int = 0

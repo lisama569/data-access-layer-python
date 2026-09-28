@@ -111,14 +111,15 @@ def test_delete_stale_version_rejected(service: ResourceService) -> None:
     assert service.get_resource(created.id).payload == "p1"
 
 
-def test_concurrent_restore_one_wins_other_sees_state_change(
+def test_concurrent_restore_one_wins_other_sees_version_conflict(
     service: ResourceService,
 ) -> None:
-    """两个并发恢复抢同一回收站资源。
+    """两个并发恢复拿着同一版本抢同一回收站资源。
 
-    写事务以 BEGIN IMMEDIATE 串行：胜者提交后败者才拿到锁，此时前置状态
-    校验看到资源已被恢复为 active，得到 invalid_state（状态前提已不成立），
-    绝不会把已恢复资源再改一次，也不会产生重复版本。
+    写事务以 BEGIN IMMEDIATE 串行：胜者提交后败者才拿到锁，此时败者重读会
+    发现版本已被推进（资源已 active），真正的原因是“自己手里的版本落后了”，
+    必须归 version_conflict 而不是 invalid_state；同时绝不会把已恢复资源再
+    改一次，也不会产生重复版本。
     """
     created = service.create_resource(ResourceCreate(name="doc"))
     service.delete_resource(
@@ -143,10 +144,69 @@ def test_concurrent_restore_one_wins_other_sees_state_change(
     t2 = threading.Thread(target=worker, args=("w2",))
     t1.start(); t2.start(); t1.join(); t2.join()
     logger.info("[TEST] concurrent restore results=%s", results)
-    assert sorted(results.values()) == ["committed", "invalid_state"]
+    assert sorted(results.values()) == ["committed", "version_conflict"]
     final = service.get_resource(created.id)
     assert final.status == "active"
     assert final.version == 3  # 只被恢复一次，版本不重复
+    # 败者拿到当前最新版本号，可据此重读后决定是否重试
+    assert "version_conflict" in results.values()
+
+
+def test_concurrent_delete_one_wins_other_sees_version_conflict(
+    service: ResourceService,
+) -> None:
+    """两个并发删除拿着同一版本（v1）抢同一正常资源。
+
+    恰有一个删除成功；败者拿到锁后发现版本已推进到 v2（资源已在回收站），
+    此时它真正的失败原因是版本落后（version_conflict），而不是“状态不允许”。
+    资源只被删一次，版本不重复。
+    """
+    created = service.create_resource(ResourceCreate(name="doc"))
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+
+    def worker(name: str) -> None:
+        barrier.wait()
+        try:
+            service.delete_resource(
+                ResourceStateChange(id=created.id, expected_version=1)
+            )
+            results[name] = "committed"
+        except VersionConflictError:
+            results[name] = VersionConflictError.code
+        except InvalidStateError:
+            results[name] = InvalidStateError.code
+
+    t1 = threading.Thread(target=worker, args=("w1",))
+    t2 = threading.Thread(target=worker, args=("w2",))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    logger.info("[TEST] concurrent delete results=%s", results)
+    assert sorted(results.values()) == ["committed", "version_conflict"]
+    ghost = service.get_resource(created.id, include_deleted=True)
+    assert ghost.status == "deleted" and ghost.version == 2
+
+
+def test_stale_retry_after_other_delete_is_version_conflict(
+    service: ResourceService,
+) -> None:
+    """拿着落后版本重复操作：别人先删了，自己再删/再恢复都报版本落后。
+
+    重点：资源确实已在回收站，但失败原因绝不能被笼统报成 invalid_state。
+    """
+    created = service.create_resource(ResourceCreate(name="doc"))
+    service.delete_resource(
+        ResourceStateChange(id=created.id, expected_version=1)
+    )  # v2，他人完成
+    # 自己手里还是 v1，再删一次 => version_conflict（不是 invalid_state）
+    with pytest.raises(VersionConflictError) as exc_info:
+        service.delete_resource(
+            ResourceStateChange(id=created.id, expected_version=1)
+        )
+    err = exc_info.value
+    assert err.expected_version == 1 and err.current_version == 2
+    # 拒绝后回收站记录原样保留，没有被覆盖
+    ghost = service.get_resource(created.id, include_deleted=True)
+    assert ghost.status == "deleted" and ghost.version == 2
 
 
 def test_restore_stale_version_rejected(service: ResourceService) -> None:
